@@ -36,8 +36,6 @@ jobs:
     timeout-minutes: 60
     outputs:
       commit: ${{ steps.source.outputs.commit }}
-      tag: ${{ steps.source.outputs.tag }}
-      artifact: ${{ steps.source.outputs.artifact }}
     env:
       NPLAY_APPLICATION_ID: com.sudingquan.nplay
       NPLAY_VERSION_NAME: ${{ inputs.version_name }}
@@ -64,8 +62,6 @@ jobs:
         shell: bash
         run: |
           printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          printf 'tag=nplay-v%s\n' "$NPLAY_VERSION_NAME" >> "$GITHUB_OUTPUT"
-          printf 'artifact=NPlay-%s-%s\n' "$NPLAY_VERSION_NAME" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
       - name: Reject credential files in source
         run: python3 scripts/check_public_tree.py
       - name: Restore private build inputs
@@ -132,7 +128,7 @@ jobs:
           cp mobile/build/outputs/apk/release/mobile-release.apk "$apk"
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk" > release-output/SIGNATURE.txt
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, re, subprocess, zipfile
+          import hashlib, json, os, pathlib, shlex, subprocess, zipfile
           out = pathlib.Path('release-output')
           apk = next(out.glob('*.apk'))
           with zipfile.ZipFile(apk) as archive:
@@ -143,9 +139,16 @@ jobs:
               if any(name.lower().endswith(('.jks', '.keystore', '.p12', '.pfx')) for name in archive.namelist()):
                   raise SystemExit('Unexpected signing container in APK.')
           badging = subprocess.check_output([os.environ['ANDROID_HOME'] + '/build-tools/36.0.0/aapt2', 'dump', 'badging', str(apk)], text=True)
-          fields = dict(re.findall(r"(name|versionCode|versionName)='([^']*)'", badging.splitlines()[0]))
+          # Match complete attribute names: compileSdkVersionCodename also ends in "name".
+          package_line = next((line for line in badging.splitlines() if line.startswith('package:')), None)
+          if package_line is None:
+              raise SystemExit('aapt2 did not return package metadata.')
+          attributes = dict(token.split('=', 1) for token in shlex.split(package_line[len('package:'):]) if '=' in token)
+          fields = {key: attributes.get(key) for key in ('name', 'versionCode', 'versionName')}
           expected = {'name': os.environ['NPLAY_APPLICATION_ID'], 'versionCode': os.environ['NPLAY_VERSION_CODE'], 'versionName': os.environ['NPLAY_VERSION_NAME']}
           if fields != expected:
+              print('Requested APK metadata: ' + json.dumps(expected))
+              print('Actual APK metadata: ' + json.dumps(fields))
               raise SystemExit('APK identity/version differs from requested configuration. Build a source ref containing the NPlay release configuration.')
           manifest = dict(application_id=fields['name'], version_name=fields['versionName'], version_code=int(fields['versionCode']),
                           source_commit=os.environ['SOURCE_COMMIT'], automated_tests='not run',
@@ -162,7 +165,8 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.source.outputs.artifact }}
+          # Avoid version/alias text in job outputs: GitHub may redact it as a secret.
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-output/
           if-no-files-found: error
           retention-days: 14
@@ -180,12 +184,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ needs.build.outputs.artifact }}
+          name: release-${{ github.run_id }}-${{ github.run_attempt }}
           path: release-output
       - name: Publish release from the exact compiled commit
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          RELEASE_TAG: nplay-v${{ inputs.version_name }}
           SOURCE_COMMIT: ${{ needs.build.outputs.commit }}
           VERSION_NAME: ${{ inputs.version_name }}
           PRERELEASE: ${{ inputs.prerelease }}
