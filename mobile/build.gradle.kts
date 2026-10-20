@@ -14,11 +14,15 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.shihab.diplay"
+        // Release automation can identify the fork without changing ordinary source builds.
+        applicationId = providers.environmentVariable("NPLAY_APPLICATION_ID")
+            .getOrElse("com.shihab.diplay")
         minSdk = 24
         targetSdk = 37
-        versionCode = 40
-        versionName = "0.2.21"
+        versionCode = providers.environmentVariable("NPLAY_VERSION_CODE")
+            .orNull?.let { value -> value.toInt().also { require(it in 1..2100000000) } }
+            ?: 40
+        versionName = providers.environmentVariable("NPLAY_VERSION_NAME").getOrElse("0.2.21")
 
     }
 

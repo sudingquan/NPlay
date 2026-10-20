@@ -1,0 +1,212 @@
+name: Build and release NPlay
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Source branch, tag or commit in this repository'
+        required: true
+        default: main
+        type: string
+      version_name:
+        description: 'App version, for example 0.2.21-nplay.1 (must be unique)'
+        required: true
+        default: 0.2.21-nplay.1
+        type: string
+      version_code:
+        description: 'Positive integer; increase it for each APK update'
+        required: true
+        default: '1'
+        type: string
+      prerelease:
+        description: 'Mark the release as a preview'
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nplay-release-${{ inputs.version_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      tag: ${{ steps.source.outputs.tag }}
+      artifact: ${{ steps.source.outputs.artifact }}
+    env:
+      NPLAY_APPLICATION_ID: com.sudingquan.nplay
+      NPLAY_VERSION_NAME: ${{ inputs.version_name }}
+      NPLAY_VERSION_CODE: ${{ inputs.version_code }}
+    steps:
+      - name: Validate version inputs
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re
+          name = os.environ['NPLAY_VERSION_NAME']
+          code = os.environ['NPLAY_VERSION_CODE']
+          if not re.fullmatch(r'[0-9][A-Za-z0-9._-]{0,63}', name):
+              raise SystemExit('Invalid version name: use up to 64 letters, digits, dots, hyphens or underscores, starting with a digit.')
+          if not re.fullmatch(r'[1-9][0-9]{0,9}', code) or int(code) > 2100000000:
+              raise SystemExit('Version code must be an integer from 1 to 2100000000.')
+          PY
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - name: Record exact source
+        id: source
+        shell: bash
+        run: |
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          printf 'tag=nplay-v%s\n' "$NPLAY_VERSION_NAME" >> "$GITHUB_OUTPUT"
+          printf 'artifact=NPlay-%s-%s\n' "$NPLAY_VERSION_NAME" "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+      - name: Reject credential files in source
+        run: python3 scripts/check_public_tree.py
+      - name: Restore private build inputs
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          DIPLAY_IDENTITY_BASE64: ${{ secrets.DIPLAY_IDENTITY_BASE64 }}
+          DIPLAY_CERTIFICATE_BASE64: ${{ secrets.DIPLAY_CERTIFICATE_BASE64 }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64, os, pathlib
+          required = ['ANDROID_KEYSTORE_BASE64', 'ANDROID_KEYSTORE_PASSWORD', 'ANDROID_KEY_ALIAS',
+                      'ANDROID_KEY_PASSWORD', 'DIPLAY_IDENTITY_BASE64', 'DIPLAY_CERTIFICATE_BASE64']
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit('Configure repository Actions secrets: ' + ', '.join(missing))
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'nplay-private'
+          auth = root / 'runtime-assets'
+          (auth / 'offline-mfi').mkdir(parents=True, mode=0o700)
+          os.chmod(root, 0o700)
+          for name, path in [
+              ('ANDROID_KEYSTORE_BASE64', root / 'release.p12'),
+              ('DIPLAY_IDENTITY_BASE64', auth / 'offline-mfi/identity.pk8'),
+              ('DIPLAY_CERTIFICATE_BASE64', auth / 'offline-mfi/certificate.p7b'),
+          ]:
+              try:
+                  data = base64.b64decode(''.join(os.environ[name].split()), validate=True)
+              except ValueError:
+                  raise SystemExit('Invalid Base64 in ' + name) from None
+              if not data:
+                  raise SystemExit('Empty file in ' + name)
+              path.write_bytes(data)
+              path.chmod(0o600)
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'ANDROID_KEYSTORE_PATH={root / "release.p12"}\n')
+              output.write(f'DIPLAY_AUTH_ASSETS_DIR={auth}\n')
+          PY
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-disabled: true
+      - name: Build signed standalone APK (no automated tests)
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew --no-daemon --no-configuration-cache :mobile:verifyStandaloneAuthentication :mobile:assembleRelease
+      - name: Verify and package APK
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.commit }}
+        shell: bash
+        run: |
+          mkdir -p release-output
+          apk="release-output/NPlay-${NPLAY_VERSION_NAME}.apk"
+          cp mobile/build/outputs/apk/release/mobile-release.apk "$apk"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk" > release-output/SIGNATURE.txt
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, zipfile
+          out = pathlib.Path('release-output')
+          apk = next(out.glob('*.apk'))
+          with zipfile.ZipFile(apk) as archive:
+              for name in ('identity.pk8', 'certificate.p7b'):
+                  local = pathlib.Path(os.environ['DIPLAY_AUTH_ASSETS_DIR']) / 'offline-mfi' / name
+                  if archive.read('assets/offline-mfi/' + name) != local.read_bytes():
+                      raise SystemExit('Packaged authentication does not match supplied input.')
+              if any(name.lower().endswith(('.jks', '.keystore', '.p12', '.pfx')) for name in archive.namelist()):
+                  raise SystemExit('Unexpected signing container in APK.')
+          badging = subprocess.check_output([os.environ['ANDROID_HOME'] + '/build-tools/36.0.0/aapt2', 'dump', 'badging', str(apk)], text=True)
+          fields = dict(re.findall(r"(name|versionCode|versionName)='([^']*)'", badging.splitlines()[0]))
+          expected = {'name': os.environ['NPLAY_APPLICATION_ID'], 'versionCode': os.environ['NPLAY_VERSION_CODE'], 'versionName': os.environ['NPLAY_VERSION_NAME']}
+          if fields != expected:
+              raise SystemExit('APK identity/version differs from requested configuration. Build a source ref containing the NPlay release configuration.')
+          manifest = dict(application_id=fields['name'], version_name=fields['versionName'], version_code=int(fields['versionCode']),
+                          source_commit=os.environ['SOURCE_COMMIT'], automated_tests='not run',
+                          workflow_run=f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}")
+          (out / 'BUILD-INFO.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          (out / 'SHA256SUMS').write_text(''.join(f'{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n' for p in sorted(out.iterdir()) if p.is_file()))
+          (out / 'RELEASE-NOTES.md').write_text(
+              f"NPlay {fields['versionName']}\n\nSource commit: `{os.environ['SOURCE_COMMIT']}`\n\n"
+              f"Application ID: `{fields['name']}`. Uses the repository's own Android signing key. "
+              "Install alongside official DiPlay; stop the other app before connecting.\n\n"
+              "Standalone APK includes explicitly supplied CarPlay authentication material, which recipients can extract. "
+              "The Android signing private key is excluded.\n\n"
+              "Automated tests were not run. Vehicle validation remains necessary.\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.artifact }}
+          path: release-output/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove private build inputs
+        if: always()
+        shell: bash
+        run: rm -rf -- "$RUNNER_TEMP/nplay-private"
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: release-output
+      - name: Publish release from the exact compiled commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.build.outputs.commit }}
+          VERSION_NAME: ${{ inputs.version_name }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, urllib.error, urllib.request
+          url = f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/git/ref/tags/{os.environ['RELEASE_TAG']}"
+          request = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json'})
+          try:
+              with urllib.request.urlopen(request, timeout=30):
+                  pass
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise SystemExit(f'Cannot check the release tag (HTTP {error.code}).') from None
+          else:
+              raise SystemExit('Release tag already exists. Use a new version name; existing tags are not reused or moved.')
+          PY
+          cd release-output
+          sha256sum --check SHA256SUMS
+          args=(--repo "$GITHUB_REPOSITORY" --target "$SOURCE_COMMIT" --title "NPlay $VERSION_NAME" --notes-file RELEASE-NOTES.md)
+          if [[ "$PRERELEASE" == true ]]; then args+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" ./*.apk SHA256SUMS BUILD-INFO.json SIGNATURE.txt "${args[@]}"
+          printf '### Release published\n\nhttps://github.com/%s/releases/tag/%s\n' "$GITHUB_REPOSITORY" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
